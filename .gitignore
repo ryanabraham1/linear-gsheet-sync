@@ -1,0 +1,7 @@
+# Local Apps Script source containing the Linear personal API key.
+Code.local.gs
+
+# Generated workbook inspection output and local dependencies.
+tools/machining-tracker.png
+node_modules/
+.DS_Store

@@ -1,0 +1,9 @@
+{
+  "name": "linear-gsheet-sync",
+  "private": true,
+  "scripts": {
+    "check": "node tests/test_code.js && node tests/test_sync_parity.mjs",
+    "sync-public": "node scripts/sync_public_copy.mjs",
+    "test-linear": "node tests/test_linear_api.mjs"
+  }
+}
