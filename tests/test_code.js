@@ -29,6 +29,12 @@ assert.equal(context.priorityValue_('#4'), 4);
 assert.equal(context.linearStatusName_('Finished'), 'Done');
 assert.equal(context.linearStatusName_('Not Started'), 'Todo');
 assert.equal(context.linearStatusName_('In Progress'), 'In Progress');
+assert.equal(context.linearIssueTitle_('0100_Bellypan'), 'Fab: 0100_Bellypan');
+assert.equal(context.linearIssueTitle_('Fab: 0100_Bellypan'), 'Fab: 0100_Bellypan');
+assert.equal(
+  context.isArchivedBySync_('[Archived by Sheets sync] Part #_Name was cleared.'),
+  true
+);
 assert.equal(context.shouldSkipHash_('abc', 'abc', 'issue-id'), true);
 assert.equal(context.shouldSkipHash_('abc', 'abc', ''), false);
 assert.match(context.hash_('test'), /^[a-f0-9]{64}$/);
@@ -51,4 +57,3 @@ assert.match(description, /\[Open file\]\(https:\/\/example\.com\/file\)/);
 assert.match(description, /range=D8/);
 
 console.log('All pure-function checks passed.');
-

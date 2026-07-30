@@ -4,7 +4,8 @@
  * Bound Google Apps Script for:
  * https://docs.google.com/spreadsheets/d/1WlHAodErTZT3_4QGyWwXvK8GIcZfhQbtOCWkGZ7PArk/
  *
- * Target: WarriorBorgs 3256 (WB) / Dumper project / Fabrication label.
+ * Target: WarriorBorgs 3256 (WB) / Dumper project / Fabrication label /
+ * Dumper Fabbed milestone.
  * Code.local.gs is the ignored local source of truth. Code.gs is its
  * publishable mirror; the API-key value must be their only difference.
  */
@@ -14,8 +15,11 @@ const CONFIG = Object.freeze({
   LINEAR_TEAM_KEY: 'WB',
   LINEAR_PROJECT_ID: 'c626362d-0b26-4d3c-afe7-d125581a0383',
   LINEAR_PROJECT_NAME: 'Dumper',
+  LINEAR_MILESTONE_ID: '95d255a1-0227-43a5-962d-0fbf07427a21',
+  LINEAR_MILESTONE_NAME: 'Dumper Fabbed',
   LINEAR_LABEL_IDS: ['8b5ea928-8841-43a0-9ec5-bc6c02e0f836'],
   LINEAR_LABEL_NAMES: ['Fabrication'],
+  LINEAR_TITLE_PREFIX: 'Fab: ',
   SPREADSHEET_URL:
     'https://docs.google.com/spreadsheets/d/1WlHAodErTZT3_4QGyWwXvK8GIcZfhQbtOCWkGZ7PArk/edit?gid=0#gid=0',
   SHEET_NAME: 'Machining Tracker',
@@ -28,6 +32,9 @@ const CONFIG = Object.freeze({
 });
 
 const LINEAR_API_URL = 'https://api.linear.app/graphql';
+const REGISTRY_PREFIX = 'LINEAR_SYNC_ISSUE_';
+const ARCHIVED_MESSAGE =
+  '[Archived by Sheets sync] Part #_Name was cleared. Restore the name to unarchive it.';
 
 const INPUT_HEADERS = Object.freeze([
   'Status',
@@ -86,7 +93,8 @@ function setupLinearSync() {
 
   spreadsheet.toast(
     'Connected to Linear team ' + CONFIG.LINEAR_TEAM_KEY + ', project ' +
-      CONFIG.LINEAR_PROJECT_NAME + ', label ' + CONFIG.LINEAR_LABEL_NAMES.join(', ') + '.',
+      CONFIG.LINEAR_PROJECT_NAME + ', label ' + CONFIG.LINEAR_LABEL_NAMES.join(', ') +
+      ', milestone ' + CONFIG.LINEAR_MILESTONE_NAME + '.',
     'Linear Sync installed',
     10
   );
@@ -112,15 +120,22 @@ function handleLinearEdit(e) {
   });
 }
 
+/** Installable change-trigger handler for physically removed spreadsheet rows. */
+function handleLinearChange(e) {
+  if (!e || e.changeType !== 'REMOVE_ROW') return;
+  runWithLock_(function () {
+    archiveMissingRegisteredIssues_();
+  });
+}
+
 /** Five-minute reconciliation trigger and safe manual entry point. */
 function syncAllRows() {
   const sheet = getSyncSheet_();
-  if (sheet.getLastRow() < CONFIG.FIRST_DATA_ROW) return;
-
   const rows = [];
   for (let row = CONFIG.FIRST_DATA_ROW; row <= sheet.getLastRow(); row += 1) rows.push(row);
   runWithLock_(function () {
     syncRows_(sheet, rows, false);
+    archiveMissingRegisteredIssues_(sheet);
   });
 }
 
@@ -159,7 +174,8 @@ function testLinearConnection() {
     'Connected as ' + data.viewer.name + '.\n\n' +
       'Team: ' + data.team.name + ' (' + CONFIG.LINEAR_TEAM_KEY + ')\n' +
       'Project: ' + data.project.name + '\n' +
-      'Label: ' + data.issueLabel.name
+      'Label: ' + data.issueLabel.name + '\n' +
+      'Milestone: ' + data.projectMilestone.name
   );
 }
 
@@ -175,6 +191,7 @@ function syncRows_(sheet, rows, force) {
     apiKey: getLinearApiKey_(),
     teamId: CONFIG.LINEAR_TEAM_ID,
     projectId: CONFIG.LINEAR_PROJECT_ID,
+    milestoneId: CONFIG.LINEAR_MILESTONE_ID,
     labelIds: CONFIG.LINEAR_LABEL_IDS.slice(),
     stateByName: null,
     stateNames: null,
@@ -203,15 +220,47 @@ function syncOneRow_(sheet, rowNumber, headerMap, context, force) {
       return;
     }
     if (!title) {
-      throw new Error('Part #_Name is required; this row was not sent to Linear.');
+      if (isArchivedBySync_(raw['Sync Error'])) {
+        const existingArchivedIssue = {
+          id: linearId,
+          identifier: stringValue_(raw['Linear Key']),
+          url: stringValue_(raw['Linear URL']),
+        };
+        writeArchiveSuccess_(
+          sheet,
+          rowNumber,
+          headerMap,
+          existingArchivedIssue,
+          raw,
+          currentHash
+        );
+        registerIssue_(existingArchivedIssue, true);
+        return;
+      }
+      const archivedIssue = archiveIssue_(context.apiKey, linearId);
+      writeArchiveSuccess_(
+        sheet,
+        rowNumber,
+        headerMap,
+        archivedIssue,
+        raw,
+        currentHash
+      );
+      registerIssue_(archivedIssue, true);
+      return;
+    }
+
+    if (linearId && isArchivedBySync_(raw['Sync Error'])) {
+      unarchiveIssue_(context.apiKey, linearId);
     }
 
     const status = linearStatusName_(raw['Status']);
     const commonInput = {
-      title: title,
+      title: linearIssueTitle_(title),
       description: machiningDescription_(raw, rowNumber),
       priority: priorityValue_(raw['Priority']),
       projectId: context.projectId,
+      projectMilestoneId: context.milestoneId,
     };
     if (status) commonInput.stateId = resolveStateId_(context, status);
 
@@ -226,6 +275,7 @@ function syncOneRow_(sheet, rowNumber, headerMap, context, force) {
     }
 
     writeSyncSuccess_(sheet, rowNumber, headerMap, issue, currentHash);
+    registerIssue_(issue, false);
   } catch (error) {
     writeSyncError_(sheet, rowNumber, headerMap, error, currentHash);
   }
@@ -273,7 +323,10 @@ function machiningRowHash_(raw, context) {
     JSON.stringify({
       teamId: context.teamId,
       projectId: context.projectId,
+      milestoneId: context.milestoneId,
       labelIds: context.labelIds,
+      titlePrefix: CONFIG.LINEAR_TITLE_PREFIX,
+      syncBehaviorVersion: 2,
       fields: fields,
     })
   );
@@ -305,6 +358,37 @@ function updateIssue_(apiKey, issueId, input) {
     throw new Error('Linear did not confirm that the issue was updated.');
   }
   return data.issueUpdate.issue;
+}
+
+function archiveIssue_(apiKey, issueId) {
+  const data = linearRequest_(
+    'mutation ArchiveIssue($id: String!) {\n' +
+      '  issueArchive(id: $id, trash: true) {\n' +
+      '    success\n' +
+      '    entity { id identifier url }\n' +
+      '  }\n' +
+      '}',
+    { id: issueId },
+    apiKey
+  );
+  if (!data.issueArchive || !data.issueArchive.success) {
+    throw new Error('Linear did not confirm that the issue was archived.');
+  }
+  return data.issueArchive.entity || { id: issueId, identifier: '', url: '' };
+}
+
+function unarchiveIssue_(apiKey, issueId) {
+  const data = linearRequest_(
+    'mutation UnarchiveIssue($id: String!) {\n' +
+      '  issueUnarchive(id: $id) { success entity { id identifier url } }\n' +
+      '}',
+    { id: issueId },
+    apiKey
+  );
+  if (!data.issueUnarchive || !data.issueUnarchive.success) {
+    throw new Error('Linear did not confirm that the issue was restored.');
+  }
+  return data.issueUnarchive.entity;
 }
 
 function linearRequest_(query, variables, apiKey) {
@@ -345,20 +429,22 @@ function linearRequest_(query, variables, apiKey) {
 function testConfiguredLinearObjects_() {
   const apiKey = getLinearApiKey_();
   const data = linearRequest_(
-    'query SyncContext($teamId: String!, $projectId: String!, $labelId: String!) {\n' +
+    'query SyncContext($teamId: String!, $projectId: String!, $labelId: String!, $milestoneId: String!) {\n' +
       '  viewer { id name email }\n' +
       '  team(id: $teamId) { id name }\n' +
       '  project(id: $projectId) { id name }\n' +
       '  issueLabel(id: $labelId) { id name }\n' +
+      '  projectMilestone(id: $milestoneId) { id name }\n' +
       '}',
     {
       teamId: CONFIG.LINEAR_TEAM_ID,
       projectId: CONFIG.LINEAR_PROJECT_ID,
       labelId: CONFIG.LINEAR_LABEL_IDS[0],
+      milestoneId: CONFIG.LINEAR_MILESTONE_ID,
     },
     apiKey
   );
-  if (!data.team || !data.project || !data.issueLabel) {
+  if (!data.team || !data.project || !data.issueLabel || !data.projectMilestone) {
     throw new Error('One or more configured Linear objects could not be found.');
   }
   return data;
@@ -489,6 +575,7 @@ function installLinearTriggers_() {
   removeLinearTriggers_();
   const spreadsheet = SpreadsheetApp.getActive();
   ScriptApp.newTrigger('handleLinearEdit').forSpreadsheet(spreadsheet).onEdit().create();
+  ScriptApp.newTrigger('handleLinearChange').forSpreadsheet(spreadsheet).onChange().create();
   ScriptApp.newTrigger('syncAllRows')
     .timeBased()
     .everyMinutes(CONFIG.RECONCILE_EVERY_MINUTES)
@@ -496,7 +583,7 @@ function installLinearTriggers_() {
 }
 
 function removeLinearTriggers_() {
-  const handlers = { handleLinearEdit: true, syncAllRows: true };
+  const handlers = { handleLinearEdit: true, handleLinearChange: true, syncAllRows: true };
   ScriptApp.getProjectTriggers().forEach(function (trigger) {
     if (handlers[trigger.getHandlerFunction()]) ScriptApp.deleteTrigger(trigger);
   });
@@ -563,6 +650,19 @@ function writeSyncSuccess_(sheet, rowNumber, headerMap, issue, currentHash) {
     ]]);
 }
 
+function writeArchiveSuccess_(sheet, rowNumber, headerMap, issue, raw, currentHash) {
+  sheet
+    .getRange(rowNumber, headerMap['Linear ID'] + 1, 1, OUTPUT_HEADERS.length)
+    .setValues([[
+      issue.id || stringValue_(raw['Linear ID']),
+      issue.identifier || stringValue_(raw['Linear Key']),
+      issue.url || stringValue_(raw['Linear URL']),
+      new Date(),
+      ARCHIVED_MESSAGE,
+      currentHash,
+    ]]);
+}
+
 function writeSyncError_(sheet, rowNumber, headerMap, error, currentHash) {
   const message = String(error && error.message ? error.message : error).slice(0, 500);
   sheet.getRange(rowNumber, headerMap['Sync Error'] + 1).setValue(message);
@@ -583,6 +683,66 @@ function shouldSkipHash_(storedHash, currentHash, linearId) {
     if (lastAttempt && Date.now() - lastAttempt < CONFIG.ERROR_RETRY_AFTER_MS) return true;
   }
   return false;
+}
+
+function linearIssueTitle_(partName) {
+  const title = stringValue_(partName);
+  if (!title) return '';
+  return /^fab:\s*/i.test(title) ? title : CONFIG.LINEAR_TITLE_PREFIX + title;
+}
+
+function isArchivedBySync_(message) {
+  return stringValue_(message).indexOf('[Archived by Sheets sync]') === 0;
+}
+
+function registerIssue_(issue, archived) {
+  if (!issue || !issue.id) return;
+  PropertiesService.getDocumentProperties().setProperty(
+    REGISTRY_PREFIX + issue.id,
+    JSON.stringify({
+      id: issue.id,
+      identifier: issue.identifier || '',
+      url: issue.url || '',
+      archived: Boolean(archived),
+      updatedAt: new Date().toISOString(),
+    })
+  );
+}
+
+function archiveMissingRegisteredIssues_(providedSheet) {
+  const sheet = providedSheet || getSyncSheet_();
+  const headerMap = getHeaderMap_(sheet);
+  const currentIds = {};
+  const rowCount = Math.max(0, sheet.getLastRow() - CONFIG.FIRST_DATA_ROW + 1);
+  if (rowCount) {
+    sheet
+      .getRange(CONFIG.FIRST_DATA_ROW, headerMap['Linear ID'] + 1, rowCount, 1)
+      .getDisplayValues()
+      .forEach(function (row) {
+        const id = stringValue_(row[0]);
+        if (id) currentIds[id] = true;
+      });
+  }
+
+  const properties = PropertiesService.getDocumentProperties();
+  const allProperties = properties.getProperties();
+  Object.keys(allProperties).forEach(function (key) {
+    if (key.indexOf(REGISTRY_PREFIX) !== 0) return;
+    let entry;
+    try {
+      entry = JSON.parse(allProperties[key]);
+    } catch (error) {
+      return;
+    }
+    if (!entry.id || entry.archived || currentIds[entry.id]) return;
+
+    try {
+      const archivedIssue = archiveIssue_(getLinearApiKey_(), entry.id);
+      registerIssue_(archivedIssue, true);
+    } catch (error) {
+      console.error('Could not archive missing Linear issue ' + entry.id + ': ' + error.message);
+    }
+  });
 }
 
 function linearStatusName_(value) {
