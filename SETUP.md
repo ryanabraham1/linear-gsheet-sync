@@ -4,11 +4,11 @@ This script is preconfigured for:
 
 - Google Sheets tab: **Machining Tracker**
 - Linear team: **WarriorBorgs 3256** (`WB`)
-- Linear project: **Dumper**
+- Linear projects selected by **Bot**: **Aimbot Changes**, **Dumper**, or **EveryBot**
 - Linear label: **Fabrication** (the workspace has no separate label named `Fab`)
-- Linear milestone: **Dumper Fabbed**
+- Linear fabrication milestone matching the selected bot project
 
-It preserves the existing tracker in columns A–N. Setup adds sync metadata in columns O–T, then hides the internal **Linear ID** and **_Sync Hash** columns.
+It preserves the existing tracker in columns A–O. Setup adds sync metadata in columns P–U, then hides the internal **Linear ID** and **_Sync Hash** columns.
 
 ## Script versions
 
@@ -29,7 +29,7 @@ After changing `Code.local.gs`, run `npm run sync-public`. This regenerates `Cod
 
 That one command:
 
-- verifies the Linear team, project, and label;
+- verifies the Linear team, all three bot projects and fabrication milestones, and the label;
 - creates the tracking columns;
 - installs an immediate edit trigger;
 - installs a five-minute reconciliation trigger; and
@@ -40,18 +40,31 @@ That one command:
 | Machining Tracker | Linear |
 |---|---|
 | Part #_Name | Issue title |
+| Bot: Aimbot | Project: Aimbot Changes; milestone: Fully Fabbed |
+| Bot: Dumper | Project: Dumper; milestone: Dumper Fabbed |
+| Bot: EveryBot | Project: EveryBot; milestone: Fully Fabbed |
+| Bot: blank | No project or project milestone |
 | Status: Not Started | Todo |
 | Status: In Progress | In Progress |
 | Status: Finished | Done |
 | Priority: #1–#4 | Urgent–Low |
 | Subsystem, quantities, stock, dimensions, length, tapped, machine, drawing, notes | Markdown issue description |
-| — | Project: Dumper |
 | — | Label: Fabrication |
-| — | Milestone: Dumper Fabbed |
 
 Every Linear description includes a link back to its source row.
 
 Every Linear issue title is prefixed with **`Fab: `**. For example, `0100_Drivebase Studio_Bellypan` becomes `Fab: 0100_Drivebase Studio_Bellypan`.
+
+Changing **Bot** moves the existing issue to the matching project and fabrication milestone. Clearing **Bot** removes both the project and project milestone without deleting or archiving the issue.
+
+## Dynamic label groups
+
+The script creates and maintains two team label groups in Linear:
+
+- **Subsystem** — the selected Subsystem becomes a child label. Numeric ordering prefixes are removed, so `01. Drivebase` becomes the `Drivebase` label.
+- **Fab Machine** — the selected Machine becomes a child label, such as `Bridgeport Mill` or `Lathe`.
+
+When either selection changes, the old child label from that group is removed and the new child label is added. The permanent **Fabrication** label and unrelated labels added manually in Linear are preserved. Subsystem and Machine also remain visible in the issue description.
 
 ## Deletions and restores
 
@@ -63,7 +76,7 @@ Every Linear issue title is prefixed with **`Fab: `**. For example, `0100_Driveb
 ## Confirm it worked
 
 1. The populated rows should receive a **Linear Key**, **Linear URL**, and **Last Synced** value.
-2. Open one Linear URL and verify its project is **Dumper**, its label is **Fabrication**, and its milestone is **Dumper Fabbed**.
+2. Open one Linear URL and verify its project and fabrication milestone match **Bot**, or that both are blank when **Bot** is blank. Its label should remain **Fabrication**.
 3. Change a tracker field. The existing Linear issue should update within a few seconds instead of creating another issue.
 4. If a row reports an error, fix the value and choose **Linear Sync → Sync selected rows now**.
 

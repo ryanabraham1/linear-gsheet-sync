@@ -4,8 +4,8 @@
  * Bound Google Apps Script for:
  * https://docs.google.com/spreadsheets/d/1WlHAodErTZT3_4QGyWwXvK8GIcZfhQbtOCWkGZ7PArk/
  *
- * Target: WarriorBorgs 3256 (WB) / Dumper project / Fabrication label /
- * Dumper Fabbed milestone.
+ * Target: WarriorBorgs 3256 (WB) / bot-selected robot project /
+ * Fabrication label / matching fabrication milestone.
  * Code.local.gs is the ignored local source of truth. Code.gs is its
  * publishable mirror; the API-key value must be their only difference.
  */
@@ -13,19 +13,42 @@ const CONFIG = Object.freeze({
   LINEAR_API_KEY: 'PASTE_LINEAR_PERSONAL_API_KEY_HERE',
   LINEAR_TEAM_ID: '16cf7cf2-dfa0-4d50-9639-48ec86de52e5',
   LINEAR_TEAM_KEY: 'WB',
-  LINEAR_PROJECT_ID: 'c626362d-0b26-4d3c-afe7-d125581a0383',
-  LINEAR_PROJECT_NAME: 'Dumper',
-  LINEAR_MILESTONE_ID: '95d255a1-0227-43a5-962d-0fbf07427a21',
-  LINEAR_MILESTONE_NAME: 'Dumper Fabbed',
+  BOT_PROJECTS: {
+    aimbot: {
+      botName: 'Aimbot',
+      projectId: 'c86bfc64-472f-41a3-a6ac-a10d02d4f07d',
+      projectName: 'Aimbot Changes',
+      milestoneId: '262fbb62-adca-4122-954e-b6550609cad2',
+      milestoneName: 'Fully Fabbed',
+    },
+    dumper: {
+      botName: 'Dumper',
+      projectId: 'c626362d-0b26-4d3c-afe7-d125581a0383',
+      projectName: 'Dumper',
+      milestoneId: '95d255a1-0227-43a5-962d-0fbf07427a21',
+      milestoneName: 'Dumper Fabbed',
+    },
+    everybot: {
+      botName: 'EveryBot',
+      projectId: 'f70a2ef5-4e36-41d0-bfe9-c8cc4352cfda',
+      projectName: 'EveryBot',
+      milestoneId: 'fabd7578-8b04-40bf-896e-b999e8666362',
+      milestoneName: 'Fully Fabbed',
+    },
+  },
   LINEAR_LABEL_IDS: ['8b5ea928-8841-43a0-9ec5-bc6c02e0f836'],
   LINEAR_LABEL_NAMES: ['Fabrication'],
   LINEAR_TITLE_PREFIX: 'Fab: ',
+  DYNAMIC_LABEL_GROUPS: {
+    subsystem: { name: 'Subsystem', color: '#5E6AD2' },
+    machine: { name: 'Fab Machine', color: '#4CB782' },
+  },
   SPREADSHEET_URL:
     'https://docs.google.com/spreadsheets/d/1WlHAodErTZT3_4QGyWwXvK8GIcZfhQbtOCWkGZ7PArk/edit?gid=0#gid=0',
   SHEET_NAME: 'Machining Tracker',
   HEADER_ROW: 3,
   FIRST_DATA_ROW: 4,
-  OUTPUT_START_COLUMN: 15, // O
+  OUTPUT_START_COLUMN: 16, // P
   RECONCILE_EVERY_MINUTES: 5,
   MAX_RUNTIME_MS: 4.5 * 60 * 1000,
   ERROR_RETRY_AFTER_MS: 15 * 60 * 1000,
@@ -38,6 +61,7 @@ const ARCHIVED_MESSAGE =
 
 const INPUT_HEADERS = Object.freeze([
   'Status',
+  'Bot',
   'Subsystem',
   'Part #_Name',
   'Priority',
@@ -78,7 +102,7 @@ function onOpen() {
 
 /**
  * Run once from Linear Sync > Install / reconnect.
- * Adds only the sync metadata columns O:T, installs triggers, and performs the
+ * Adds only the sync metadata columns P:U, installs triggers, and performs the
  * initial upload of every populated machining row.
  */
 function setupLinearSync() {
@@ -88,13 +112,14 @@ function setupLinearSync() {
 
   initializeSyncColumns_();
   testConfiguredLinearObjects_();
+  ensureConfiguredLabelGroups_(getLinearApiKey_(), CONFIG.LINEAR_TEAM_ID);
   installLinearTriggers_();
   syncAllRows();
 
   spreadsheet.toast(
-    'Connected to Linear team ' + CONFIG.LINEAR_TEAM_KEY + ', project ' +
-      CONFIG.LINEAR_PROJECT_NAME + ', label ' + CONFIG.LINEAR_LABEL_NAMES.join(', ') +
-      ', milestone ' + CONFIG.LINEAR_MILESTONE_NAME + '.',
+    'Connected to Linear team ' + CONFIG.LINEAR_TEAM_KEY + '. Bot selections now choose ' +
+      'the robot project; blank Bot cells stay projectless. Label: ' +
+      CONFIG.LINEAR_LABEL_NAMES.join(', ') + '.',
     'Linear Sync installed',
     10
   );
@@ -173,9 +198,10 @@ function testLinearConnection() {
   SpreadsheetApp.getUi().alert(
     'Connected as ' + data.viewer.name + '.\n\n' +
       'Team: ' + data.team.name + ' (' + CONFIG.LINEAR_TEAM_KEY + ')\n' +
-      'Project: ' + data.project.name + '\n' +
-      'Label: ' + data.issueLabel.name + '\n' +
-      'Milestone: ' + data.projectMilestone.name
+      'Bot projects: ' + data.botProjects.map(function (project) {
+        return project.botName + ' -> ' + project.project.name;
+      }).join(', ') + '\n' +
+      'Label: ' + data.issueLabel.name
   );
 }
 
@@ -187,12 +213,14 @@ function removeLinearTriggers() {
 function syncRows_(sheet, rows, force) {
   const startedAt = Date.now();
   const headerMap = getHeaderMap_(sheet);
+  const apiKey = getLinearApiKey_();
+  const labelGroups = ensureConfiguredLabelGroups_(apiKey, CONFIG.LINEAR_TEAM_ID);
   const context = {
-    apiKey: getLinearApiKey_(),
+    apiKey: apiKey,
     teamId: CONFIG.LINEAR_TEAM_ID,
-    projectId: CONFIG.LINEAR_PROJECT_ID,
-    milestoneId: CONFIG.LINEAR_MILESTONE_ID,
     labelIds: CONFIG.LINEAR_LABEL_IDS.slice(),
+    labelGroups: labelGroups,
+    dynamicLabelCache: {},
     stateByName: null,
     stateNames: null,
   };
@@ -255,22 +283,29 @@ function syncOneRow_(sheet, rowNumber, headerMap, context, force) {
     }
 
     const status = linearStatusName_(raw['Status']);
+    const botProject = resolveBotProject_(raw['Bot']);
+    const dynamicLabelIds = resolveDynamicLabelIds_(context, raw);
     const commonInput = {
       title: linearIssueTitle_(title),
       description: machiningDescription_(raw, rowNumber),
       priority: priorityValue_(raw['Priority']),
-      projectId: context.projectId,
-      projectMilestoneId: context.milestoneId,
     };
+    if (botProject) {
+      commonInput.projectId = botProject.projectId;
+      commonInput.projectMilestoneId = botProject.milestoneId;
+    } else if (linearId) {
+      commonInput.projectId = null;
+      commonInput.projectMilestoneId = null;
+    }
     if (status) commonInput.stateId = resolveStateId_(context, status);
 
     let issue;
     if (linearId) {
-      commonInput.addedLabelIds = context.labelIds;
+      commonInput.labelIds = getFinalIssueLabelIds_(context, linearId, dynamicLabelIds);
       issue = updateIssue_(context.apiKey, linearId, commonInput);
     } else {
       commonInput.teamId = context.teamId;
-      commonInput.labelIds = context.labelIds;
+      commonInput.labelIds = uniqueStrings_(context.labelIds.concat(dynamicLabelIds));
       issue = createIssue_(context.apiKey, commonInput);
     }
 
@@ -279,6 +314,21 @@ function syncOneRow_(sheet, rowNumber, headerMap, context, force) {
   } catch (error) {
     writeSyncError_(sheet, rowNumber, headerMap, error, currentHash);
   }
+}
+
+function resolveBotProject_(value) {
+  const bot = stringValue_(value);
+  if (!bot) return null;
+  const project = CONFIG.BOT_PROJECTS[bot.toLowerCase()];
+  if (!project) {
+    throw new Error(
+      'Unknown Bot "' + bot + '". Available: ' +
+        Object.keys(CONFIG.BOT_PROJECTS).map(function (key) {
+          return CONFIG.BOT_PROJECTS[key].botName;
+        }).join(', ')
+    );
+  }
+  return project;
 }
 
 function machiningDescription_(raw, rowNumber) {
@@ -301,7 +351,7 @@ function machiningDescription_(raw, rowNumber) {
   }
   addDescriptionLine_(lines, 'Notes', raw['Notes']);
 
-  const rowUrl = CONFIG.SPREADSHEET_URL.replace(/#.*$/, '') + '#gid=0&range=D' + rowNumber;
+  const rowUrl = CONFIG.SPREADSHEET_URL.replace(/#.*$/, '') + '#gid=0&range=E' + rowNumber;
   lines.push('');
   lines.push('---');
   lines.push('**Source:** [Machining Tracker row ' + rowNumber + '](' + rowUrl + ')');
@@ -322,11 +372,11 @@ function machiningRowHash_(raw, context) {
   return hash_(
     JSON.stringify({
       teamId: context.teamId,
-      projectId: context.projectId,
-      milestoneId: context.milestoneId,
+      botProjects: CONFIG.BOT_PROJECTS,
       labelIds: context.labelIds,
       titlePrefix: CONFIG.LINEAR_TITLE_PREFIX,
-      syncBehaviorVersion: 2,
+      dynamicLabelGroups: CONFIG.DYNAMIC_LABEL_GROUPS,
+      syncBehaviorVersion: 5,
       fields: fields,
     })
   );
@@ -391,6 +441,151 @@ function unarchiveIssue_(apiKey, issueId) {
   return data.issueUnarchive.entity;
 }
 
+function ensureConfiguredLabelGroups_(apiKey, teamId) {
+  const result = {};
+  Object.keys(CONFIG.DYNAMIC_LABEL_GROUPS).forEach(function (key) {
+    const definition = CONFIG.DYNAMIC_LABEL_GROUPS[key];
+    result[key] = {
+      id: getOrCreateLabelGroup_(apiKey, teamId, key, definition),
+      name: definition.name,
+      color: definition.color,
+    };
+  });
+  return result;
+}
+
+function getOrCreateLabelGroup_(apiKey, teamId, groupKey, definition) {
+  const properties = PropertiesService.getDocumentProperties();
+  const propertyKey = 'LINEAR_LABEL_GROUP_' + groupKey.toUpperCase();
+  const cachedId = properties.getProperty(propertyKey);
+  if (cachedId) return cachedId;
+
+  const data = linearRequest_(
+    'query FindLabelGroup($teamId: ID!, $name: String!) {\n' +
+      '  issueLabels(first: 10, filter: {\n' +
+      '    team: { id: { eq: $teamId } }\n' +
+      '    name: { eqIgnoreCase: $name }\n' +
+      '    isGroup: { eq: true }\n' +
+      '  }) { nodes { id name isGroup } }\n' +
+      '}',
+    { teamId: teamId, name: definition.name },
+    apiKey
+  );
+  let group = data.issueLabels.nodes[0];
+  if (!group) {
+    group = createIssueLabel_(apiKey, {
+      name: definition.name,
+      color: definition.color,
+      teamId: teamId,
+      isGroup: true,
+    });
+  }
+  properties.setProperty(propertyKey, group.id);
+  return group.id;
+}
+
+function resolveDynamicLabelIds_(context, raw) {
+  const selected = [];
+  const subsystem = labelNameFromCell_(raw['Subsystem']);
+  const machine = labelNameFromCell_(raw['Machine']);
+  if (subsystem) {
+    selected.push(
+      getOrCreateChildLabel_(context, context.labelGroups.subsystem, subsystem)
+    );
+  }
+  if (machine) {
+    selected.push(getOrCreateChildLabel_(context, context.labelGroups.machine, machine));
+  }
+  return uniqueStrings_(selected);
+}
+
+function getOrCreateChildLabel_(context, group, labelName) {
+  const memoryKey = group.id + '|' + labelName.toLowerCase();
+  if (context.dynamicLabelCache[memoryKey]) {
+    return context.dynamicLabelCache[memoryKey];
+  }
+
+  const properties = PropertiesService.getDocumentProperties();
+  const propertyKey = 'LINEAR_CHILD_LABEL_' + hash_(memoryKey).slice(0, 24);
+  const cachedId = properties.getProperty(propertyKey);
+  if (cachedId) {
+    context.dynamicLabelCache[memoryKey] = cachedId;
+    return cachedId;
+  }
+
+  const data = linearRequest_(
+    'query FindChildLabel($teamId: ID!, $parentId: ID!, $name: String!) {\n' +
+      '  issueLabels(first: 10, filter: {\n' +
+      '    team: { id: { eq: $teamId } }\n' +
+      '    parent: { id: { eq: $parentId } }\n' +
+      '    name: { eqIgnoreCase: $name }\n' +
+      '    isGroup: { eq: false }\n' +
+      '  }) { nodes { id name parent { id } } }\n' +
+      '}',
+    { teamId: context.teamId, parentId: group.id, name: labelName },
+    context.apiKey
+  );
+  let label = data.issueLabels.nodes[0];
+  if (!label) {
+    label = createIssueLabel_(context.apiKey, {
+      name: labelName,
+      color: group.color,
+      teamId: context.teamId,
+      parentId: group.id,
+      isGroup: false,
+    });
+  }
+  properties.setProperty(propertyKey, label.id);
+  context.dynamicLabelCache[memoryKey] = label.id;
+  return label.id;
+}
+
+function createIssueLabel_(apiKey, input) {
+  const data = linearRequest_(
+    'mutation CreateIssueLabel($input: IssueLabelCreateInput!) {\n' +
+      '  issueLabelCreate(input: $input) {\n' +
+      '    success\n' +
+      '    issueLabel { id name isGroup parent { id } }\n' +
+      '  }\n' +
+      '}',
+    { input: input },
+    apiKey
+  );
+  if (!data.issueLabelCreate || !data.issueLabelCreate.success) {
+    throw new Error('Linear did not confirm that the label was created.');
+  }
+  return data.issueLabelCreate.issueLabel;
+}
+
+function getFinalIssueLabelIds_(context, issueId, selectedIds) {
+  const data = linearRequest_(
+    'query CurrentIssueLabels($id: String!) {\n' +
+      '  issue(id: $id) {\n' +
+      '    labels { nodes { id name parent { id } } }\n' +
+      '  }\n' +
+      '}',
+    { id: issueId },
+    context.apiKey
+  );
+  if (!data.issue) throw new Error('Could not read the current Linear issue labels.');
+
+  return finalIssueLabelIds_(context, data.issue.labels.nodes, selectedIds);
+}
+
+function finalIssueLabelIds_(context, currentLabels, selectedIds) {
+  const dynamicGroupIds = {};
+  Object.keys(context.labelGroups).forEach(function (key) {
+    dynamicGroupIds[context.labelGroups[key].id] = true;
+  });
+
+  const preservedLabelIds = [];
+  currentLabels.forEach(function (label) {
+    const parentId = label.parent && label.parent.id;
+    if (!parentId || !dynamicGroupIds[parentId]) preservedLabelIds.push(label.id);
+  });
+  return uniqueStrings_(preservedLabelIds.concat(context.labelIds, selectedIds));
+}
+
 function linearRequest_(query, variables, apiKey) {
   const response = UrlFetchApp.fetch(LINEAR_API_URL, {
     method: 'post',
@@ -429,24 +624,47 @@ function linearRequest_(query, variables, apiKey) {
 function testConfiguredLinearObjects_() {
   const apiKey = getLinearApiKey_();
   const data = linearRequest_(
-    'query SyncContext($teamId: String!, $projectId: String!, $labelId: String!, $milestoneId: String!) {\n' +
+    'query SyncContext($teamId: String!, $labelId: String!) {\n' +
       '  viewer { id name email }\n' +
       '  team(id: $teamId) { id name }\n' +
-      '  project(id: $projectId) { id name }\n' +
       '  issueLabel(id: $labelId) { id name }\n' +
-      '  projectMilestone(id: $milestoneId) { id name }\n' +
       '}',
     {
       teamId: CONFIG.LINEAR_TEAM_ID,
-      projectId: CONFIG.LINEAR_PROJECT_ID,
       labelId: CONFIG.LINEAR_LABEL_IDS[0],
-      milestoneId: CONFIG.LINEAR_MILESTONE_ID,
     },
     apiKey
   );
-  if (!data.team || !data.project || !data.issueLabel || !data.projectMilestone) {
+  if (!data.team || !data.issueLabel) {
     throw new Error('One or more configured Linear objects could not be found.');
   }
+  data.botProjects = Object.keys(CONFIG.BOT_PROJECTS).map(function (key) {
+    const botProject = CONFIG.BOT_PROJECTS[key];
+    const projectData = linearRequest_(
+      'query BotProject($projectId: String!, $milestoneId: String!) {\n' +
+        '  project(id: $projectId) { id name }\n' +
+        '  projectMilestone(id: $milestoneId) { id name project { id } }\n' +
+        '}',
+      {
+        projectId: botProject.projectId,
+        milestoneId: botProject.milestoneId,
+      },
+      apiKey
+    );
+    if (
+      !projectData.project ||
+      !projectData.projectMilestone ||
+      !projectData.projectMilestone.project ||
+      projectData.projectMilestone.project.id !== projectData.project.id
+    ) {
+      throw new Error('Invalid Linear project or milestone for Bot "' + botProject.botName + '".');
+    }
+    return {
+      botName: botProject.botName,
+      project: projectData.project,
+      milestone: projectData.projectMilestone,
+    };
+  });
   return data;
 }
 
@@ -544,7 +762,7 @@ function initializeSyncColumns_() {
   });
   if (hasExisting && existing.join('|') !== OUTPUT_HEADERS.join('|')) {
     throw new Error(
-      'Columns O:T are not empty and do not contain the expected Linear sync headers. ' +
+      'Columns P:U are not empty and do not contain the expected Linear sync headers. ' +
         'Move that data elsewhere before installing.'
     );
   }
@@ -560,15 +778,20 @@ function initializeSyncColumns_() {
     .setHorizontalAlignment('center')
     .setVerticalAlignment('middle');
 
-  sheet.setColumnWidth(16, 100);
-  sheet.setColumnWidth(17, 280);
-  sheet.setColumnWidth(18, 165);
-  sheet.setColumnWidth(19, 320);
+  sheet.setColumnWidth(CONFIG.OUTPUT_START_COLUMN + 1, 100);
+  sheet.setColumnWidth(CONFIG.OUTPUT_START_COLUMN + 2, 280);
+  sheet.setColumnWidth(CONFIG.OUTPUT_START_COLUMN + 3, 165);
+  sheet.setColumnWidth(CONFIG.OUTPUT_START_COLUMN + 4, 320);
   sheet
-    .getRange(CONFIG.FIRST_DATA_ROW, 18, Math.max(1, sheet.getMaxRows() - 3), 1)
+    .getRange(
+      CONFIG.FIRST_DATA_ROW,
+      CONFIG.OUTPUT_START_COLUMN + 3,
+      Math.max(1, sheet.getMaxRows() - 3),
+      1
+    )
     .setNumberFormat('yyyy-mm-dd hh:mm:ss');
-  sheet.hideColumns(15);
-  sheet.hideColumns(20);
+  sheet.hideColumns(CONFIG.OUTPUT_START_COLUMN);
+  sheet.hideColumns(CONFIG.OUTPUT_START_COLUMN + OUTPUT_HEADERS.length - 1);
 }
 
 function installLinearTriggers_() {
@@ -689,6 +912,21 @@ function linearIssueTitle_(partName) {
   const title = stringValue_(partName);
   if (!title) return '';
   return /^fab:\s*/i.test(title) ? title : CONFIG.LINEAR_TITLE_PREFIX + title;
+}
+
+function labelNameFromCell_(value) {
+  return stringValue_(value)
+    .replace(/^\d+\s*[.\-_:]\s*/, '')
+    .trim();
+}
+
+function uniqueStrings_(values) {
+  const seen = {};
+  return values.filter(function (value) {
+    if (!value || seen[value]) return false;
+    seen[value] = true;
+    return true;
+  });
 }
 
 function isArchivedBySync_(message) {
